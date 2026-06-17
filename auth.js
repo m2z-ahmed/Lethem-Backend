@@ -125,7 +125,7 @@ async function ensureDefaultOrganization(user) {
     const { rows } = await query(
       `INSERT INTO organizations (id, name, slug, owner_user_id)
        VALUES ($1, $2, $3, $4)
-       RETURNING id, name, slug`,
+       RETURNING id, name, slug, plan, subscription_status, razorpay_subscription_id`,
       [organizationId, organizationName, organizationSlug, user.id],
     );
     await query(
@@ -147,7 +147,7 @@ async function ensureDefaultOrganization(user) {
 
 async function loadUserOrganizations(userId) {
   const { rows } = await query(
-    `SELECT o.id, o.name, o.slug, om.role, EXTRACT(EPOCH FROM o.created_at)::bigint AS created_at
+    `SELECT o.id, o.name, o.slug, o.plan, o.subscription_status, o.razorpay_subscription_id, om.role, EXTRACT(EPOCH FROM o.created_at)::bigint AS created_at
      FROM organizations o
      JOIN organization_members om ON om.organization_id = o.id
      WHERE om.user_id = $1

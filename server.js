@@ -1,11 +1,12 @@
 'use strict';
 
 require('dotenv').config();
-const { randomUUID, createHash } = require('crypto');
+const { randomUUID, createHash, createHmac } = require('crypto');
 const fastify = require('fastify')({ logger: { level: 'info' }, genReqId: () => randomUUID() });
 const { createClient } = require('redis');
 const { query, initDb, encryptSecret, decryptSecret } = require('./db');
 const { requireAuth, requireOrgRole, loadUserOrganizations } = require('./auth');
+const { BILLING_PLANS, publicBillingConfig } = require('./billing');
 const { listProviders, listModels, getProvider, getProviderForModel, getDefaultModel, isModelAllowedForProvider, normalizeAllowedModels, normalizeProviderModel, normalizeUsage, estimateCostUsd, callProvider, normalizeProviderResponse } = require('./providers');
 
 const DEFAULT_RPM_LIMIT = Number(process.env.RATE_LIMIT_DEFAULT_PER_MIN || 2);
@@ -147,6 +148,91 @@ fastify.get('/api/admin/error-logs', async (req, reply) => {
 });
 
 
+
+function billingPlanById(planId) {
+  return BILLING_PLANS.find((plan) => plan.id === String(planId || '').toLowerCase());
+}
+
+function getPlanProjectLimit(planId) {
+  const plan = billingPlanById(planId) || billingPlanById('free');
+  return plan?.limits?.projects ?? 999999;
+}
+
+function requireRazorpayConfig(reply) {
+  const keyId = process.env.RAZORPAY_KEY_ID;
+  const keySecret = process.env.RAZORPAY_KEY_SECRET;
+  if (!keyId || !keySecret) {
+    reply.code(503).send(ERR('RAZORPAY_NOT_CONFIGURED', 'Razorpay keys are not configured on the server'));
+    return null;
+  }
+  return { keyId, keySecret };
+}
+
+async function razorpayRequest(path, method = 'GET', body = null) {
+  const keyId = process.env.RAZORPAY_KEY_ID;
+  const keySecret = process.env.RAZORPAY_KEY_SECRET;
+  const res = await fetch(`https://api.razorpay.com/v1${path}`, {
+    method,
+    headers: {
+      Authorization: `Basic ${Buffer.from(`${keyId}:${keySecret}`).toString('base64')}`,
+      'Content-Type': 'application/json',
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data?.error?.description || data?.error?.reason || `Razorpay HTTP ${res.status}`);
+  return data;
+}
+
+fastify.get('/api/billing/plans', async (req, reply) => {
+  const auth = await requireAuth(req, reply); if (!auth) return;
+  return { ...publicBillingConfig(), currentPlan: auth.organization.plan || 'free', subscriptionStatus: auth.organization.subscription_status || 'free', subscriptionId: auth.organization.razorpay_subscription_id || null };
+});
+
+fastify.post('/api/billing/subscriptions', async (req, reply) => {
+  const auth = await requireOrgRole(req, reply, ['owner', 'admin']); if (!auth) return;
+  const cfg = requireRazorpayConfig(reply); if (!cfg) return;
+  const plan = billingPlanById(req.body?.planId);
+  if (!plan || plan.id === 'free' || !plan.razorpayPlanId) return reply.code(400).send(ERR('INVALID_PLAN', 'Select a paid Razorpay plan'));
+  const customerNotify = Boolean(req.body?.customerNotify ?? false);
+  const notes = { app: 'keygate', organization_id: auth.organization.id, organization_slug: auth.organization.slug, plan: plan.id };
+  const subscription = await razorpayRequest('/subscriptions', 'POST', {
+    plan_id: plan.razorpayPlanId,
+    total_count: 120,
+    quantity: 1,
+    customer_notify: customerNotify ? 1 : 0,
+    notes,
+  });
+  await query(
+    `UPDATE organizations SET plan = $1, razorpay_subscription_id = $2, subscription_status = $3, updated_at = NOW() WHERE id = $4`,
+    [plan.id, subscription.id, subscription.status || 'created', auth.organization.id],
+  );
+  await query(
+    `INSERT INTO billing_events (id,organization_id,event_type,razorpay_subscription_id,payload) VALUES ($1,$2,$3,$4,$5::jsonb)`,
+    [randomUUID(), auth.organization.id, 'subscription_created', subscription.id, JSON.stringify(subscription)],
+  );
+  return { subscriptionId: subscription.id, status: subscription.status, planId: plan.id, keyId: cfg.keyId, currency: 'INR' };
+});
+
+fastify.post('/api/billing/verify', async (req, reply) => {
+  const auth = await requireOrgRole(req, reply, ['owner', 'admin']); if (!auth) return;
+  const cfg = requireRazorpayConfig(reply); if (!cfg) return;
+  const { razorpay_payment_id, razorpay_subscription_id, razorpay_signature, planId } = req.body || {};
+  if (!razorpay_payment_id || !razorpay_subscription_id || !razorpay_signature) return reply.code(400).send(ERR('MISSING_PAYMENT_FIELDS', 'Missing Razorpay payment verification fields'));
+  const expected = createHmac('sha256', cfg.keySecret).update(`${razorpay_payment_id}|${razorpay_subscription_id}`).digest('hex');
+  if (expected !== razorpay_signature) return reply.code(400).send(ERR('INVALID_SIGNATURE', 'Razorpay payment signature is invalid'));
+  const plan = billingPlanById(planId) || billingPlanById('pro');
+  await query(
+    `UPDATE organizations SET plan = $1, razorpay_subscription_id = $2, subscription_status = 'active', updated_at = NOW() WHERE id = $3`,
+    [plan.id, razorpay_subscription_id, auth.organization.id],
+  );
+  await query(
+    `INSERT INTO billing_events (id,organization_id,event_type,razorpay_subscription_id,razorpay_payment_id,payload) VALUES ($1,$2,$3,$4,$5,$6::jsonb)`,
+    [randomUUID(), auth.organization.id, 'payment_verified', razorpay_subscription_id, razorpay_payment_id, JSON.stringify(req.body)],
+  );
+  return { success: true, planId: plan.id, status: 'active' };
+});
+
 fastify.get('/api/me', async (req, reply) => {
   const auth = await requireAuth(req, reply); if (!auth) return;
   const organizations = await loadUserOrganizations(auth.user.id);
@@ -200,7 +286,8 @@ fastify.post('/api/projects', {
   if (!name) return reply.code(400).send(ERR('VALIDATION_ERROR', 'name required'));
   const auth = await requireOrgRole(req, reply, ['owner', 'admin']); if (!auth) return;
   const { rows: countRows } = await query('SELECT COUNT(*)::int AS c FROM projects WHERE organization_id = $1', [auth.organization.id]);
-  if ((countRows[0]?.c || 0) >= 3) return reply.code(400).send(ERR('PROJECT_LIMIT_REACHED', 'max 3 projects allowed for now'));
+  const projectLimit = getPlanProjectLimit(auth.organization.plan);
+  if ((countRows[0]?.c || 0) >= projectLimit) return reply.code(400).send(ERR('PROJECT_LIMIT_REACHED', `max ${projectLimit} projects allowed on your current plan`));
   const id = randomUUID();
   const generatedSlug = `project-${Math.random().toString(36).slice(2, 10)}`;
   await query(`INSERT INTO projects (id,name,slug,status,organization_id) VALUES ($1,$2,$3,$4,$5)`, [id, String(name).trim(), slug ? String(slug).trim() : generatedSlug, 'active', auth.organization.id]);
@@ -600,10 +687,12 @@ async function start() {
       EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='users') AS users_ok,
       EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='organizations') AS organizations_ok,
       EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='organization_members') AS organization_members_ok,
-      EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='projects' AND column_name='organization_id') AS project_org_ok
+      EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='projects' AND column_name='organization_id') AS project_org_ok,
+      EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='organizations' AND column_name='plan') AS org_plan_ok,
+      EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='billing_events') AS billing_events_ok
   `);
   const c = schemaChecks[0] || {};
-  if (!(c.projects_ok && c.subkeys_token_cipher_ok && c.subkeys_token_iv_ok && c.subkeys_token_tag_ok && c.health_ok && c.error_logs_ok && c.request_log_request_id_ok && c.request_log_provider_ok && c.request_log_error_reason_ok && c.request_log_cost_ok && c.users_ok && c.organizations_ok && c.organization_members_ok && c.project_org_ok)) {
+  if (!(c.projects_ok && c.subkeys_token_cipher_ok && c.subkeys_token_iv_ok && c.subkeys_token_tag_ok && c.health_ok && c.error_logs_ok && c.request_log_request_id_ok && c.request_log_provider_ok && c.request_log_error_reason_ok && c.request_log_cost_ok && c.users_ok && c.organizations_ok && c.organization_members_ok && c.project_org_ok && c.org_plan_ok && c.billing_events_ok)) {
     throw new Error('Schema drift detected. Apply migrations in order: 001_initial_postgres.sql, 002_health_monitoring.sql, 003_request_error_logs.sql, 004_request_log_details.sql, 005_auth_organizations.sql');
   }
 
