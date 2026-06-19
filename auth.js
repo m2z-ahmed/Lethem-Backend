@@ -93,7 +93,7 @@ function slugify(value) {
 async function syncAuthUser(claims) {
   const auth0Sub = String(claims.sub);
   const email = claims.email || null;
-  const name = claims.name || claims.nickname || email || 'KeyGate User';
+  const name = claims.name || claims.nickname || email || 'Lethem User';
   const pictureUrl = claims.picture || null;
   const { rows } = await query(
     `INSERT INTO users (id, auth0_sub, email, name, picture_url, updated_at)

@@ -17,7 +17,7 @@ const isUuid = (v) => /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{
 fastify.register(require('@fastify/cors'), {
   origin: true,
   methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'x-keygate-client', 'x-project-id'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-lethem-client', 'x-keygate-client', 'x-project-id'],
 });
 fastify.register(require('@fastify/helmet'), { contentSecurityPolicy: false });
 
@@ -30,7 +30,7 @@ async function insertRequestLog({ req, subkey = {}, model = null, tokensUsed = 0
   await query(
     `INSERT INTO request_logs (id,request_id,project_id,subkey_id,subkey_name,provider,model,tokens_used,prompt_tokens,completion_tokens,estimated_cost_usd,status,error_reason,source,latency_ms)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
-    [id, req.id, subkey.project_id, subkey.id || null, subkey.name || null, provider, model, tokensUsed, promptTokens, completionTokens, estimatedCostUsd, status, errorReason, source || req.headers['x-keygate-client'] || 'external', latencyMs],
+    [id, req.id, subkey.project_id, subkey.id || null, subkey.name || null, provider, model, tokensUsed, promptTokens, completionTokens, estimatedCostUsd, status, errorReason, source || req.headers['x-lethem-client'] || req.headers['x-keygate-client'] || 'external', latencyMs],
   );
   req.log.info({
     event: 'gateway_request_log',
@@ -195,7 +195,7 @@ fastify.post('/api/billing/subscriptions', async (req, reply) => {
   const plan = billingPlanById(req.body?.planId);
   if (!plan || plan.id === 'free' || !plan.razorpayPlanId) return reply.code(400).send(ERR('INVALID_PLAN', 'Select a paid Razorpay plan'));
   const customerNotify = Boolean(req.body?.customerNotify ?? false);
-  const notes = { app: 'keygate', organization_id: auth.organization.id, organization_slug: auth.organization.slug, plan: plan.id };
+  const notes = { app: 'lethem', organization_id: auth.organization.id, organization_slug: auth.organization.slug, plan: plan.id };
   const subscription = await razorpayRequest('/subscriptions', 'POST', {
     plan_id: plan.razorpayPlanId,
     total_count: 120,
@@ -396,7 +396,7 @@ fastify.get('/api/subkeys', async (req, reply) => {
   const project = await getProject(req, reply); if (!project) return;
   const { rows } = await query(`SELECT id, name, token_prefix, token_ciphertext_b64, token_iv_b64, token_auth_tag_b64, provider, master_key_id, auto_route_on_exhausted, monthly_token_limit, requests_per_minute_limit, tokens_used, status, spend_limit_usd, max_requests, request_count, allowed_models, EXTRACT(EPOCH FROM expires_at)::bigint AS expires_at, EXTRACT(EPOCH FROM created_at)::bigint AS created_at FROM subkeys WHERE project_id = $1 ORDER BY created_at DESC`, [project.id]);
   return rows.map((row) => {
-    let token_preview = `${row.token_prefix || 'sk-kg-'}••••`;
+    let token_preview = `${row.token_prefix || 'sk-lt-'}••••`;
     if (row.token_prefix && row.token_ciphertext_b64 && row.token_iv_b64 && row.token_auth_tag_b64) {
       try {
         const token = decryptSecret({ ciphertext_b64: row.token_ciphertext_b64, iv_b64: row.token_iv_b64, auth_tag_b64: row.token_auth_tag_b64 }, `subkey:${row.id}`);
@@ -492,7 +492,7 @@ fastify.post('/api/subkeys', {
   if (invalidModels.length) return reply.code(400).send(ERR('MODEL_PROVIDER_MISMATCH', `Models not valid for ${provider}: ${invalidModels.join(', ')}`));
   const storedAllowed = normalizedAllowed.includes('all') ? ['all'] : normalizedAllowed.map((model) => normalizeProviderModel(provider, model));
   const id = randomUUID();
-  const token = `sk-kg-${randomUUID().replace(/-/g, '')}`;
+  const token = `sk-lt-${randomUUID().replace(/-/g, '')}`;
   const enc = encryptSecret(token, `subkey:${id}`);
   const expiresAt = expires_in_days ? new Date(Date.now() + Number(expires_in_days) * 86400 * 1000) : null;
   await query(`INSERT INTO subkeys (id,project_id,name,token_hash,token_prefix,token_ciphertext_b64,token_iv_b64,token_auth_tag_b64,token_key_version,provider,master_key_id,auto_route_on_exhausted,monthly_token_limit,requests_per_minute_limit,spend_limit_usd,max_requests,allowed_models,expires_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`, [id, project.id, name, hashToken(token), token.slice(0, 12), enc.ciphertext_b64, enc.iv_b64, enc.auth_tag_b64, enc.key_version, provider, master_key_id, Boolean(auto_route_on_exhausted), Number(monthly_token_limit) || 50000, DEFAULT_RPM_LIMIT, spend_limit_usd, Number(max_requests) || 5000, JSON.stringify(storedAllowed), expiresAt]);
@@ -566,7 +566,7 @@ fastify.post('/api/quota-requests', {
 fastify.post('/v1/chat/completions', async (req, reply) => {
   const started = Date.now();
   const payload = req.body || {};
-  const source = req.headers['x-keygate-client'] || 'external';
+  const source = req.headers['x-lethem-client'] || req.headers['x-keygate-client'] || 'external';
   const bearer = (req.headers.authorization || '').replace(/^Bearer\s+/i, '').trim();
   const finishMs = () => Date.now() - started;
   if (!bearer) {
