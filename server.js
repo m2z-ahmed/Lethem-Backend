@@ -10,7 +10,21 @@ const { BILLING_PLANS, publicBillingConfig } = require('./billing');
 const { listProviders, listModels, getProvider, getProviderForModel, getDefaultModel, isModelAllowedForProvider, normalizeAllowedModels, normalizeProviderModel, normalizeUsage, estimateCostUsd, callProvider, normalizeProviderResponse } = require('./providers');
 
 const DEFAULT_RPM_LIMIT = Number(process.env.RATE_LIMIT_DEFAULT_PER_MIN || 2);
-const redis = createClient({ url: process.env.REDIS_URL });
+const redis = createClient({
+  url: process.env.REDIS_URL,
+  socket: {
+    reconnectStrategy: (retries) => Math.min(retries * 100, 3000),
+  },
+});
+redis.on('error', (err) => {
+  fastify.log.warn({ err }, 'redis client error');
+});
+redis.on('reconnecting', () => {
+  fastify.log.warn('redis reconnecting');
+});
+redis.on('ready', () => {
+  fastify.log.info('redis connection ready');
+});
 const ERR = (code, message) => ({ error: { code, message } });
 const isUuid = (v) => /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(v || ''));
 
@@ -23,6 +37,18 @@ fastify.register(require('@fastify/helmet'), { contentSecurityPolicy: false });
 
 function hashToken(token) { return createHash('sha256').update(token).digest('hex'); }
 function maskKey(apiKey) { return apiKey.slice(0, 7) + '••••••••' + apiKey.slice(-4); }
+
+async function pingRedis() {
+  if (!redis.isReady) throw new Error('redis connection is not ready');
+  return redis.ping();
+}
+
+async function incrementRedisWindow(key, ttlSec) {
+  if (!redis.isReady) return null;
+  const count = await redis.incr(key);
+  if (count === 1) await redis.expire(key, ttlSec);
+  return count;
+}
 
 async function insertRequestLog({ req, subkey = {}, model = null, tokensUsed = 0, promptTokens = 0, completionTokens = 0, status, errorReason = null, source, latencyMs, estimatedCostUsd = 0 }) {
   const id = randomUUID();
@@ -54,10 +80,16 @@ async function rateLimitBySubkey(subkeyId, limit = DEFAULT_RPM_LIMIT) {
   const windowSec = 60;
   const windowStart = Math.floor(nowSec / windowSec) * windowSec;
   const redisKey = `rl:subkey:${subkeyId}:${windowStart}`;
-  const count = await redis.incr(redisKey);
-  if (count === 1) await redis.expire(redisKey, windowSec);
-  const remaining = Math.max(limit - count, 0);
+  let count = 0;
+  try {
+    count = await incrementRedisWindow(redisKey, windowSec);
+  } catch (err) {
+    fastify.log.warn({ err, subkeyId }, 'redis rate limit check failed; allowing request');
+    count = null;
+  }
   const reset = windowStart + windowSec;
+  if (count === null) return { remaining: limit, reset, limit, allowed: true };
+  const remaining = Math.max(limit - count, 0);
   return { remaining, reset, limit, allowed: count <= limit };
 }
 
@@ -93,7 +125,7 @@ fastify.get('/health/db', async (req, reply) => {
 
 fastify.get('/health/redis', async (req, reply) => {
   try {
-    await redis.ping();
+    await pingRedis();
     return { ok: true };
   } catch (e) {
     return reply.code(500).send(ERR('REDIS_UNHEALTHY', e.message || 'redis unavailable'));
@@ -110,7 +142,7 @@ fastify.post('/api/health/refresh-now', async (req, reply) => {
   try {
     let db_ok = false; let redis_ok = false;
     try { await query('SELECT 1'); db_ok = true; } catch (_) {}
-    try { await redis.ping(); redis_ok = true; } catch (_) {}
+    try { await pingRedis(); redis_ok = true; } catch (_) {}
     const internal_ok = db_ok && redis_ok;
     await query(
       `INSERT INTO health_daily (day, internal_ok, db_ok, redis_ok, details, updated_at)
@@ -411,9 +443,13 @@ fastify.get('/api/subkeys/:id/demo-token', async (req, reply) => {
   const project = await getProject(req, reply); if (!project) return;
   const ip = req.ip || 'unknown';
   const demoKey = `rl:demo-token:${project.id}:${ip}`;
-  const demoCount = await redis.incr(demoKey);
-  if (demoCount === 1) await redis.expire(demoKey, 60);
-  if (demoCount > 20) return reply.code(429).send(ERR('RATE_LIMITED', 'too many demo token requests'));
+  let demoCount = null;
+  try {
+    demoCount = await incrementRedisWindow(demoKey, 60);
+  } catch (err) {
+    req.log.warn({ err }, 'redis demo-token rate limit check failed; allowing request');
+  }
+  if (demoCount !== null && demoCount > 20) return reply.code(429).send(ERR('RATE_LIMITED', 'too many demo token requests'));
   const { rows } = await query(
     `SELECT id, status, token_ciphertext_b64, token_iv_b64, token_auth_tag_b64
      FROM subkeys WHERE id = $1 AND project_id = $2 LIMIT 1`,
@@ -699,7 +735,7 @@ async function start() {
   const writeDailyHealth = async () => {
     let db_ok = false; let redis_ok = false;
     try { await query('SELECT 1'); db_ok = true; } catch (_) {}
-    try { await redis.ping(); redis_ok = true; } catch (_) {}
+    try { await pingRedis(); redis_ok = true; } catch (_) {}
     const internal_ok = db_ok && redis_ok;
     await query(
       `INSERT INTO health_daily (day, internal_ok, db_ok, redis_ok, details, updated_at)
