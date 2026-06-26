@@ -271,6 +271,28 @@ fastify.get('/api/me', async (req, reply) => {
   return { user: auth.user, organization: auth.organization, organizations };
 });
 
+fastify.patch('/api/me', {
+  schema: { body: { type: 'object', properties: { name: { type: 'string' }, email: { type: 'string' }, workspaceName: { type: 'string' } } } },
+}, async (req, reply) => {
+  const auth = await requireOrgRole(req, reply, ['owner', 'admin']); if (!auth) return;
+  const name = String(req.body?.name || '').trim();
+  const email = String(req.body?.email || '').trim().toLowerCase();
+  const workspaceName = String(req.body?.workspaceName || '').trim();
+  if (!name) return reply.code(400).send(ERR('VALIDATION_ERROR', 'name required'));
+  if (!/^\S+@\S+\.\S+$/.test(email)) return reply.code(400).send(ERR('VALIDATION_ERROR', 'valid email required'));
+  if (!workspaceName) return reply.code(400).send(ERR('VALIDATION_ERROR', 'workspace name required'));
+
+  const { rows: userRows } = await query(
+    `UPDATE users SET name = $1, email = $2, updated_at = NOW() WHERE id = $3 RETURNING id, auth0_sub, email, name, picture_url`,
+    [name, email, auth.user.id],
+  );
+  const { rows: orgRows } = await query(
+    `UPDATE organizations SET name = $1, updated_at = NOW() WHERE id = $2 RETURNING id, name, slug, plan, subscription_status, razorpay_subscription_id`,
+    [workspaceName, auth.organization.id],
+  );
+  return { user: userRows[0], organization: { ...orgRows[0], role: auth.organization.role } };
+});
+
 async function getProject(req, reply) {
   const auth = await requireAuth(req, reply); if (!auth) return null;
   const projectRef = String(req.headers['x-project-id'] || '').trim();

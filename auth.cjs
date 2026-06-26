@@ -98,7 +98,7 @@ async function syncAuthUser(claims) {
   const { rows } = await query(
     `INSERT INTO users (id, auth0_sub, email, name, picture_url, updated_at)
      VALUES ($1, $2, $3, $4, $5, NOW())
-     ON CONFLICT (auth0_sub) DO UPDATE SET email = EXCLUDED.email, name = EXCLUDED.name, picture_url = EXCLUDED.picture_url, updated_at = NOW()
+     ON CONFLICT (auth0_sub) DO UPDATE SET email = COALESCE(users.email, EXCLUDED.email), name = COALESCE(NULLIF(users.name, ''), EXCLUDED.name), picture_url = EXCLUDED.picture_url, updated_at = NOW()
      RETURNING id, auth0_sub, email, name, picture_url`,
     [randomUUID(), auth0Sub, email, name, pictureUrl],
   );
