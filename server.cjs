@@ -84,7 +84,7 @@ async function acceptInviteForUser({ inviteId = null, token = null, user }) {
   if (token) { params.push(hashToken(String(token))); where = 'oi.token_hash = $1'; }
   else { params.push(String(inviteId || '')); where = 'oi.id = $1'; }
   const { rows } = await query(
-    `SELECT oi.id, oi.organization_id, oi.role, oi.email, oi.invited_user_id
+    `SELECT oi.id, oi.organization_id, oi.project_id, oi.role, oi.email, oi.invited_user_id
      FROM organization_invites oi
      WHERE ${where} AND oi.accepted_at IS NULL AND oi.revoked_at IS NULL AND oi.expires_at > NOW()
      LIMIT 1`,
@@ -98,12 +98,21 @@ async function acceptInviteForUser({ inviteId = null, token = null, user }) {
   if (!invitedUserMatches && invitedEmail !== userEmail) return { error: 'INVITE_EMAIL_MISMATCH' };
   await query('BEGIN');
   try {
-    await query(
-      `INSERT INTO organization_members (organization_id, user_id, role, updated_at)
-       VALUES ($1,$2,$3,NOW())
-       ON CONFLICT (organization_id, user_id) DO UPDATE SET role = EXCLUDED.role, updated_at = NOW()`,
-      [invite.organization_id, user.id, normalizeOrgRole(invite.role)],
-    );
+    if (invite.project_id) {
+      await query(
+        `INSERT INTO project_members (project_id, user_id, role, updated_at)
+         VALUES ($1,$2,$3,NOW())
+         ON CONFLICT (project_id, user_id) DO UPDATE SET role = EXCLUDED.role, updated_at = NOW()`,
+        [invite.project_id, user.id, normalizeOrgRole(invite.role)],
+      );
+    } else {
+      await query(
+        `INSERT INTO organization_members (organization_id, user_id, role, updated_at)
+         VALUES ($1,$2,$3,NOW())
+         ON CONFLICT (organization_id, user_id) DO UPDATE SET role = EXCLUDED.role, updated_at = NOW()`,
+        [invite.organization_id, user.id, normalizeOrgRole(invite.role)],
+      );
+    }
     await query(
       `UPDATE organization_invites SET accepted_at = NOW(), accepted_by_user_id = $1, invited_user_id = COALESCE(invited_user_id, $1), updated_at = NOW() WHERE id = $2`,
       [user.id, invite.id],
@@ -389,10 +398,12 @@ async function getProject(req, reply) {
     return null;
   }
   const { rows } = await query(
-    `SELECT p.id,p.name,p.slug,p.status,p.organization_id,om.role AS organization_role
+    `SELECT p.id,p.name,p.slug,p.status,p.organization_id,COALESCE(om.role, pm.role) AS organization_role
      FROM projects p
-     JOIN organization_members om ON om.organization_id = p.organization_id AND om.user_id = $2
+     LEFT JOIN organization_members om ON om.organization_id = p.organization_id AND om.user_id = $2 AND om.role IN ('owner','admin')
+     LEFT JOIN project_members pm ON pm.project_id = p.id AND pm.user_id = $2
      WHERE (p.id::text = $1 OR p.slug = $1)
+       AND (om.user_id IS NOT NULL OR pm.user_id IS NOT NULL)
      LIMIT 1`,
     [projectRef, auth.user.id],
   );
@@ -411,15 +422,23 @@ async function getProject(req, reply) {
 
 
 fastify.get('/api/members', async (req, reply) => {
-  const auth = await requireAuth(req, reply); if (!auth) return;
+  const project = await getProject(req, reply); if (!project) return;
+  const auth = req.auth;
   const { rows } = await query(
-    `SELECT om.user_id AS id, om.role, EXTRACT(EPOCH FROM om.created_at)::bigint AS joined_at,
-            u.email, u.name, u.picture_url
-     FROM organization_members om
-     JOIN users u ON u.id = om.user_id
-     WHERE om.organization_id = $1
-     ORDER BY CASE om.role WHEN 'owner' THEN 1 WHEN 'admin' THEN 2 WHEN 'developer' THEN 3 ELSE 4 END, om.created_at ASC`,
-    [auth.organization.id],
+    `(SELECT om.user_id AS id, om.role, EXTRACT(EPOCH FROM om.created_at)::bigint AS joined_at,
+            u.email, u.name, u.picture_url, true AS workspace_member
+       FROM organization_members om
+       JOIN users u ON u.id = om.user_id
+       WHERE om.organization_id = $1 AND om.role IN ('owner','admin'))
+     UNION ALL
+     (SELECT pm.user_id AS id, pm.role, EXTRACT(EPOCH FROM pm.created_at)::bigint AS joined_at,
+            u.email, u.name, u.picture_url, false AS workspace_member
+       FROM project_members pm
+       JOIN users u ON u.id = pm.user_id
+       WHERE pm.project_id = $2
+         AND NOT EXISTS (SELECT 1 FROM organization_members om WHERE om.organization_id = $1 AND om.user_id = pm.user_id AND om.role IN ('owner','admin')))
+     ORDER BY CASE role WHEN 'owner' THEN 1 WHEN 'admin' THEN 2 WHEN 'developer' THEN 3 ELSE 4 END, joined_at ASC`,
+    [project.organization_id, project.id],
   );
   return rows.map((row) => ({ ...row, role: normalizeOrgRole(row.role), is_current_user: row.id === auth.user.id }));
 });
@@ -427,28 +446,34 @@ fastify.get('/api/members', async (req, reply) => {
 fastify.patch('/api/members/:userId', {
   schema: { body: { type: 'object', required: ['role'], properties: { role: { type: 'string' } } } },
 }, async (req, reply) => {
-  const auth = await requireOrgRole(req, reply, ['owner', 'admin']); if (!auth) return;
+  const project = await getProject(req, reply); if (!project) return;
+  if (!['owner', 'admin'].includes(project.organization_role)) return reply.code(403).send(ERR('FORBIDDEN', 'Your project role does not allow this action.'));
+  const auth = req.auth;
   const role = normalizeOrgRole(req.body?.role);
   if (role === 'owner') return reply.code(400).send(ERR('VALIDATION_ERROR', 'Owner transfers are not supported here.'));
   const userId = String(req.params.userId || '');
   if (userId === auth.user.id) return reply.code(400).send(ERR('VALIDATION_ERROR', 'You cannot change your own role.'));
   const { rows } = await query(
-    `UPDATE organization_members SET role = $1, updated_at = NOW()
-     WHERE organization_id = $2 AND user_id = $3 AND role <> 'owner'
+    `UPDATE project_members SET role = $1, updated_at = NOW()
+     WHERE project_id = $2 AND user_id = $3
+       AND NOT EXISTS (SELECT 1 FROM organization_members om WHERE om.organization_id = $4 AND om.user_id = $3 AND om.role IN ('owner','admin'))
      RETURNING user_id AS id, role`,
-    [role, auth.organization.id, userId],
+    [role, project.id, userId, project.organization_id],
   );
   if (!rows[0]) return reply.code(404).send(ERR('MEMBER_NOT_FOUND', 'member not found'));
   return { success: true, member: rows[0] };
 });
 
 fastify.delete('/api/members/:userId', async (req, reply) => {
-  const auth = await requireOrgRole(req, reply, ['owner', 'admin']); if (!auth) return;
+  const project = await getProject(req, reply); if (!project) return;
+  if (!['owner', 'admin'].includes(project.organization_role)) return reply.code(403).send(ERR('FORBIDDEN', 'Your project role does not allow this action.'));
+  const auth = req.auth;
   const userId = String(req.params.userId || '');
   if (userId === auth.user.id) return reply.code(400).send(ERR('VALIDATION_ERROR', 'You cannot remove yourself.'));
   const { rowCount } = await query(
-    `DELETE FROM organization_members WHERE organization_id = $1 AND user_id = $2 AND role <> 'owner'`,
-    [auth.organization.id, userId],
+    `DELETE FROM project_members WHERE project_id = $1 AND user_id = $2
+     AND NOT EXISTS (SELECT 1 FROM organization_members om WHERE om.organization_id = $3 AND om.user_id = $2 AND om.role IN ('owner','admin'))`,
+    [project.id, userId, project.organization_id],
   );
   return { success: true, removed: rowCount > 0 };
 });
@@ -469,8 +494,11 @@ fastify.post('/api/invites/accept', {
 
 fastify.get('/api/invites', async (req, reply) => {
   const auth = await requireAuth(req, reply); if (!auth) return;
+  const projectRef = String(req.headers['x-project-id'] || '').trim();
+  let scopedProject = null;
+  if (projectRef) { scopedProject = await getProject(req, reply); if (!scopedProject) return; }
   const { rows } = await query(
-    `SELECT oi.id, oi.organization_id, o.name AS organization_name, oi.email, oi.role,
+    `SELECT oi.id, oi.organization_id, oi.project_id, o.name AS organization_name, p.name AS project_name, oi.email, oi.role,
             oi.invited_user_id, oi.accepted_by_user_id,
             oi.accepted_at IS NOT NULL AS accepted, oi.revoked_at IS NOT NULL AS revoked,
             EXTRACT(EPOCH FROM oi.created_at)::bigint AS created_at,
@@ -480,11 +508,12 @@ fastify.get('/api/invites', async (req, reply) => {
             invited.name AS invited_user_name, invited.email AS invited_user_email
      FROM organization_invites oi
      JOIN organizations o ON o.id = oi.organization_id
+     LEFT JOIN projects p ON p.id = oi.project_id
      LEFT JOIN users inviter ON inviter.id = oi.invited_by_user_id
      LEFT JOIN users invited ON invited.id = oi.invited_user_id
-     WHERE oi.organization_id = $1 OR oi.invited_user_id = $2 OR LOWER(oi.email) = LOWER($3)
+     WHERE ((oi.organization_id = $1 AND ($4::uuid IS NULL OR oi.project_id = $4::uuid)) OR oi.invited_user_id = $2 OR LOWER(oi.email) = LOWER($3))
      ORDER BY oi.created_at DESC`,
-    [auth.organization.id, auth.user.id, auth.user.email || ''],
+    [auth.organization.id, auth.user.id, auth.user.email || '', scopedProject?.id || null],
   );
   return rows.map((row) => {
     const now = Math.floor(Date.now()/1000);
@@ -494,13 +523,21 @@ fastify.get('/api/invites', async (req, reply) => {
 });
 
 async function checkInviteeHandler(req, reply) {
-  const auth = await requireOrgRole(req, reply, ['owner', 'admin']); if (!auth) return;
+  const project = await getProject(req, reply); if (!project) return;
+  if (!['owner', 'admin'].includes(project.organization_role)) return reply.code(403).send(ERR('FORBIDDEN', 'Your project role does not allow this action.'));
+  const auth = req.auth;
   const email = String(req.body?.email || req.query?.email || '').trim().toLowerCase();
   if (!isEmail(email)) return reply.code(400).send(ERR('VALIDATION_ERROR', 'valid email required'));
   const user = await findUserByEmail(email);
   const { rows: existingMembers } = await query(
-    `SELECT 1 FROM organization_members om JOIN users u ON u.id = om.user_id WHERE om.organization_id = $1 AND LOWER(u.email) = $2 AND u.account_status = 'active' LIMIT 1`,
-    [auth.organization.id, email],
+    `SELECT 1 FROM users u
+     WHERE LOWER(u.email) = $2 AND u.account_status = 'active'
+       AND (
+         EXISTS (SELECT 1 FROM organization_members om WHERE om.organization_id = $1 AND om.user_id = u.id AND om.role IN ('owner','admin'))
+         OR EXISTS (SELECT 1 FROM project_members pm WHERE pm.project_id = $3 AND pm.user_id = u.id)
+       )
+     LIMIT 1`,
+    [project.organization_id, email, project.id],
   );
   return { email, exists: Boolean(user), already_member: Boolean(existingMembers[0]), user: user ? { id: user.id, email: user.email, name: user.name, picture_url: user.picture_url, email_verified: user.email_verified, account_status: user.account_status } : null };
 }
@@ -517,27 +554,35 @@ fastify.get('/api/invite/check', checkInviteeHandler);
 fastify.post('/api/invites', {
   schema: { body: { type: 'object', required: ['email', 'role'], properties: { email: { type: 'string' }, role: { type: 'string' } } } },
 }, async (req, reply) => {
-  const auth = await requireOrgRole(req, reply, ['owner', 'admin']); if (!auth) return;
+  const project = await getProject(req, reply); if (!project) return;
+  if (!['owner', 'admin'].includes(project.organization_role)) return reply.code(403).send(ERR('FORBIDDEN', 'Your project role does not allow this action.'));
+  const auth = req.auth;
   const email = String(req.body?.email || '').trim().toLowerCase();
   const role = normalizeOrgRole(req.body?.role);
   if (!isEmail(email)) return reply.code(400).send(ERR('VALIDATION_ERROR', 'valid email required'));
   if (role === 'owner') return reply.code(400).send(ERR('VALIDATION_ERROR', 'Invite admin, developer, or viewer roles.'));
   const invitedUser = await findUserByEmail(email);
   const { rows: existingMembers } = await query(
-    `SELECT 1 FROM organization_members om JOIN users u ON u.id = om.user_id WHERE om.organization_id = $1 AND LOWER(u.email) = $2 AND u.account_status = 'active' LIMIT 1`,
-    [auth.organization.id, email],
+    `SELECT 1 FROM users u
+     WHERE LOWER(u.email) = $2 AND u.account_status = 'active'
+       AND (
+         EXISTS (SELECT 1 FROM organization_members om WHERE om.organization_id = $1 AND om.user_id = u.id AND om.role IN ('owner','admin'))
+         OR EXISTS (SELECT 1 FROM project_members pm WHERE pm.project_id = $3 AND pm.user_id = u.id)
+       )
+     LIMIT 1`,
+    [project.organization_id, email, project.id],
   );
-  if (existingMembers[0]) return reply.code(409).send(ERR('ALREADY_MEMBER', 'This user is already in this workspace.'));
+  if (existingMembers[0]) return reply.code(409).send(ERR('ALREADY_MEMBER', 'This user is already a member of this project.'));
   const token = randomUUID() + randomUUID().replace(/-/g, '');
   const id = randomUUID();
   await query(
-    `INSERT INTO organization_invites (id, organization_id, email, role, token_hash, invited_by_user_id, invited_user_id, expires_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,NOW() + INTERVAL '7 days')`,
-    [id, auth.organization.id, email, role, hashToken(token), auth.user.id, invitedUser?.id || null],
+    `INSERT INTO organization_invites (id, organization_id, project_id, email, role, token_hash, invited_by_user_id, invited_user_id, expires_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW() + INTERVAL '7 days')`,
+    [id, project.organization_id, project.id, email, role, hashToken(token), auth.user.id, invitedUser?.id || null],
   );
   let emailResult = { sent: false, skipped: true, reason: 'Existing Lethem user gets an in-app invite' };
   if (!invitedUser) {
-    const emailContent = inviteEmailContent({ role, organizationName: auth.organization.name, inviterName: auth.user.name || auth.user.email, token });
+    const emailContent = inviteEmailContent({ role, organizationName: project.name || auth.organization.name, inviterName: auth.user.name || auth.user.email, token });
     emailResult = await sendEmail({ to: email, ...emailContent });
     if (!emailResult.sent) req.log.error({ emailResult, invited_email: email }, 'invite email failed');
   }
@@ -565,9 +610,11 @@ fastify.delete('/api/invites/:id', async (req, reply) => {
 fastify.get('/api/projects', async (req, reply) => {
   const auth = await requireAuth(req, reply); if (!auth) return;
   const { rows } = await query(
-    `SELECT p.id,p.name,p.slug,p.status,p.organization_id,om.role AS organization_role,EXTRACT(EPOCH FROM p.created_at)::bigint AS created_at
+    `SELECT p.id,p.name,p.slug,p.status,p.organization_id,COALESCE(om.role, pm.role) AS organization_role,EXTRACT(EPOCH FROM p.created_at)::bigint AS created_at
      FROM projects p
-     JOIN organization_members om ON om.organization_id = p.organization_id AND om.user_id = $1
+     LEFT JOIN organization_members om ON om.organization_id = p.organization_id AND om.user_id = $1 AND om.role IN ('owner','admin')
+     LEFT JOIN project_members pm ON pm.project_id = p.id AND pm.user_id = $1
+     WHERE om.user_id IS NOT NULL OR pm.user_id IS NOT NULL
      ORDER BY p.created_at DESC`,
     [auth.user.id],
   );
@@ -595,7 +642,7 @@ async function deleteProjectByRef(req, reply, projectRef) {
   if (!ref) return { success: true, deleted: false, reason: 'empty_ref' };
   const { rows } = await query(
     `SELECT p.id,p.slug FROM projects p
-     JOIN organization_members om ON om.organization_id = p.organization_id AND om.user_id = $2
+     JOIN organization_members om ON om.organization_id = p.organization_id AND om.user_id = $2 AND om.role IN ('owner','admin')
      WHERE (p.slug = $1 OR p.id::text = $1) LIMIT 1`,
     [ref, auth.user.id],
   );
@@ -986,6 +1033,7 @@ async function start() {
       EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='users') AS users_ok,
       EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='organizations') AS organizations_ok,
       EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='organization_members') AS organization_members_ok,
+      EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='project_members') AS project_members_ok,
       EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='projects' AND column_name='organization_id') AS project_org_ok,
       EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='organizations' AND column_name='plan') AS org_plan_ok,
       EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='billing_events') AS billing_events_ok,
@@ -995,8 +1043,8 @@ async function start() {
       EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='last_seen_at') AS users_last_seen_ok
   `);
   const c = schemaChecks[0] || {};
-  if (!(c.projects_ok && c.subkeys_token_cipher_ok && c.subkeys_token_iv_ok && c.subkeys_token_tag_ok && c.health_ok && c.error_logs_ok && c.request_log_request_id_ok && c.request_log_provider_ok && c.request_log_error_reason_ok && c.request_log_cost_ok && c.users_ok && c.organizations_ok && c.organization_members_ok && c.project_org_ok && c.org_plan_ok && c.billing_events_ok && c.organization_invites_ok && c.organization_invites_user_ok && c.users_account_status_ok && c.users_last_seen_ok)) {
-    throw new Error('Schema drift detected. Apply migrations in order: 001_initial_postgres.sql, 002_health_monitoring.sql, 003_request_error_logs.sql, 004_request_log_details.sql, 005_auth_organizations.sql, 006_billing_subscriptions.sql, 007_members_invites.sql, 008_invited_user_relation.sql, 009_user_registry_status.sql');
+  if (!(c.projects_ok && c.subkeys_token_cipher_ok && c.subkeys_token_iv_ok && c.subkeys_token_tag_ok && c.health_ok && c.error_logs_ok && c.request_log_request_id_ok && c.request_log_provider_ok && c.request_log_error_reason_ok && c.request_log_cost_ok && c.users_ok && c.organizations_ok && c.organization_members_ok && c.project_members_ok && c.project_org_ok && c.org_plan_ok && c.billing_events_ok && c.organization_invites_ok && c.organization_invites_user_ok && c.users_account_status_ok && c.users_last_seen_ok)) {
+    throw new Error('Schema drift detected. Apply migrations in order: 001_initial_postgres.sql, 002_health_monitoring.sql, 003_request_error_logs.sql, 004_request_log_details.sql, 005_auth_organizations.sql, 006_billing_subscriptions.sql, 007_members_invites.sql, 008_invited_user_relation.sql, 009_user_registry_status.sql, 010_user_onboarding.sql, 011_project_scoped_members.sql');
   }
 
   const writeDailyHealth = async () => {

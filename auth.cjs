@@ -147,7 +147,7 @@ async function acceptPendingInvites(user) {
   const email = String(user?.email || '').trim().toLowerCase();
   if (!email) return;
   const { rows } = await query(
-    `SELECT id, organization_id, role
+    `SELECT id, organization_id, project_id, role
      FROM organization_invites
      WHERE LOWER(email) = $1 AND accepted_at IS NULL AND revoked_at IS NULL AND expires_at > NOW()`,
     [email],
@@ -155,12 +155,21 @@ async function acceptPendingInvites(user) {
   for (const invite of rows) {
     await query('BEGIN');
     try {
-      await query(
-        `INSERT INTO organization_members (organization_id, user_id, role, updated_at)
-         VALUES ($1, $2, $3, NOW())
-         ON CONFLICT (organization_id, user_id) DO UPDATE SET role = EXCLUDED.role, updated_at = NOW()`,
-        [invite.organization_id, user.id, normalizeOrgRole(invite.role)],
-      );
+      if (invite.project_id) {
+        await query(
+          `INSERT INTO project_members (project_id, user_id, role, updated_at)
+           VALUES ($1, $2, $3, NOW())
+           ON CONFLICT (project_id, user_id) DO UPDATE SET role = EXCLUDED.role, updated_at = NOW()`,
+          [invite.project_id, user.id, normalizeOrgRole(invite.role)],
+        );
+      } else {
+        await query(
+          `INSERT INTO organization_members (organization_id, user_id, role, updated_at)
+           VALUES ($1, $2, $3, NOW())
+           ON CONFLICT (organization_id, user_id) DO UPDATE SET role = EXCLUDED.role, updated_at = NOW()`,
+          [invite.organization_id, user.id, normalizeOrgRole(invite.role)],
+        );
+      }
       await query(
         `UPDATE organization_invites SET accepted_at = NOW(), accepted_by_user_id = $1, invited_user_id = COALESCE(invited_user_id, $1), updated_at = NOW() WHERE id = $2`,
         [user.id, invite.id],
