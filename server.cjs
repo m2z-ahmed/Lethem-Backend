@@ -600,20 +600,26 @@ fastify.post('/api/invites', {
 
 fastify.delete('/api/invites/:id', async (req, reply) => {
   const auth = await requireAuth(req, reply); if (!auth) return;
-  const { rowCount } = await query(
-    `UPDATE organization_invites
-     SET revoked_at = NOW(), updated_at = NOW()
+  const { rows } = await query(
+    `SELECT id, accepted_at IS NOT NULL AS accepted, revoked_at IS NOT NULL AS revoked, expires_at < NOW() AS expired
+     FROM organization_invites
      WHERE id = $1
-       AND accepted_at IS NULL
-       AND revoked_at IS NULL
        AND (
          organization_id = $2
          OR invited_user_id = $3
          OR LOWER(email) = LOWER($4)
-       )`,
+       )
+     LIMIT 1`,
     [req.params.id, auth.organization.id, auth.user.id, auth.user.email || ''],
   );
-  return { success: true, revoked: rowCount > 0 };
+  const invite = rows[0];
+  if (!invite) return { success: true, deleted: false, revoked: false };
+  if (!invite.accepted && !invite.revoked && !invite.expired) {
+    await query('UPDATE organization_invites SET revoked_at = NOW(), updated_at = NOW() WHERE id = $1', [invite.id]);
+    return { success: true, revoked: true, deleted: false };
+  }
+  await query('DELETE FROM organization_invites WHERE id = $1', [invite.id]);
+  return { success: true, deleted: true, revoked: false };
 });
 
 fastify.get('/api/projects', async (req, reply) => {
