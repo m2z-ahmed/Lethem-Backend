@@ -280,6 +280,11 @@ function getPlanProjectLimit(planId) {
   return plan?.limits?.projects ?? 999999;
 }
 
+function getPlanMasterKeyLimit(planId) {
+  const plan = billingPlanById(planId) || billingPlanById('free');
+  return plan?.limits?.masterKeys ?? 999999;
+}
+
 function requireRazorpayConfig(reply) {
   const keyId = process.env.RAZORPAY_KEY_ID;
   const keySecret = process.env.RAZORPAY_KEY_SECRET;
@@ -398,8 +403,9 @@ async function getProject(req, reply) {
     return null;
   }
   const { rows } = await query(
-    `SELECT p.id,p.name,p.slug,p.status,p.organization_id,COALESCE(om.role, pm.role) AS organization_role
+    `SELECT p.id,p.name,p.slug,p.status,p.organization_id,o.plan AS organization_plan,COALESCE(om.role, pm.role) AS organization_role
      FROM projects p
+     JOIN organizations o ON o.id = p.organization_id
      LEFT JOIN organization_members om ON om.organization_id = p.organization_id AND om.user_id = $2 AND om.role IN ('owner','admin')
      LEFT JOIN project_members pm ON pm.project_id = p.id AND pm.user_id = $2
      WHERE (p.id::text = $1 OR p.slug = $1)
@@ -425,22 +431,19 @@ fastify.get('/api/members', async (req, reply) => {
   const project = await getProject(req, reply); if (!project) return;
   const auth = req.auth;
   const { rows } = await query(
-    `SELECT *
-       FROM (
-         SELECT om.user_id AS id, om.role, EXTRACT(EPOCH FROM om.created_at)::bigint AS joined_at,
-                u.email, u.name, u.picture_url, true AS workspace_member
-           FROM organization_members om
-           JOIN users u ON u.id = om.user_id
-           WHERE om.organization_id = $1 AND om.role IN ('owner','admin')
-         UNION ALL
-         SELECT pm.user_id AS id, pm.role, EXTRACT(EPOCH FROM pm.created_at)::bigint AS joined_at,
-                u.email, u.name, u.picture_url, false AS workspace_member
-           FROM project_members pm
-           JOIN users u ON u.id = pm.user_id
-           WHERE pm.project_id = $2
-             AND NOT EXISTS (SELECT 1 FROM organization_members om WHERE om.organization_id = $1 AND om.user_id = pm.user_id AND om.role IN ('owner','admin'))
-       ) members
-      ORDER BY CASE role WHEN 'owner' THEN 1 WHEN 'admin' THEN 2 WHEN 'developer' THEN 3 ELSE 4 END, joined_at ASC`,
+    `(SELECT om.user_id AS id, om.role, EXTRACT(EPOCH FROM om.created_at)::bigint AS joined_at,
+            u.email, u.name, u.picture_url, true AS workspace_member
+       FROM organization_members om
+       JOIN users u ON u.id = om.user_id
+       WHERE om.organization_id = $1 AND om.role IN ('owner','admin'))
+     UNION ALL
+     (SELECT pm.user_id AS id, pm.role, EXTRACT(EPOCH FROM pm.created_at)::bigint AS joined_at,
+            u.email, u.name, u.picture_url, false AS workspace_member
+       FROM project_members pm
+       JOIN users u ON u.id = pm.user_id
+       WHERE pm.project_id = $2
+         AND NOT EXISTS (SELECT 1 FROM organization_members om WHERE om.organization_id = $1 AND om.user_id = pm.user_id AND om.role IN ('owner','admin')))
+     ORDER BY CASE role WHEN 'owner' THEN 1 WHEN 'admin' THEN 2 WHEN 'developer' THEN 3 ELSE 4 END, joined_at ASC`,
     [project.organization_id, project.id],
   );
   return rows.map((row) => ({ ...row, role: normalizeOrgRole(row.role), is_current_user: row.id === auth.user.id }));
@@ -613,16 +616,13 @@ fastify.delete('/api/invites/:id', async (req, reply) => {
 fastify.get('/api/projects', async (req, reply) => {
   const auth = await requireAuth(req, reply); if (!auth) return;
   const { rows } = await query(
-    `SELECT p.id,p.name,p.slug,p.status,p.organization_id,COALESCE(om.role, pm.role) AS organization_role,
-            (p.organization_id <> $2) AS invited_project,
-            (p.organization_id = $2) AS own_project,
-            EXTRACT(EPOCH FROM p.created_at)::bigint AS created_at
+    `SELECT p.id,p.name,p.slug,p.status,p.organization_id,COALESCE(om.role, pm.role) AS organization_role,EXTRACT(EPOCH FROM p.created_at)::bigint AS created_at
      FROM projects p
      LEFT JOIN organization_members om ON om.organization_id = p.organization_id AND om.user_id = $1 AND om.role IN ('owner','admin')
      LEFT JOIN project_members pm ON pm.project_id = p.id AND pm.user_id = $1
      WHERE om.user_id IS NOT NULL OR pm.user_id IS NOT NULL
      ORDER BY p.created_at DESC`,
-    [auth.user.id, auth.organization.id],
+    [auth.user.id],
   );
   return rows;
 });
@@ -703,6 +703,10 @@ fastify.post('/api/master-keys', {
   const { provider, api_key, name } = req.body || {};
   if (!provider || !api_key) return reply.code(400).send(ERR('VALIDATION_ERROR', 'provider and api_key required'));
   if (!getProvider(provider)) return reply.code(400).send(ERR('UNKNOWN_PROVIDER', `Unknown provider ${provider}`));
+  const masterKeyLimit = getPlanMasterKeyLimit(project.organization_plan || 'free');
+  const { rows: countRows } = await query('SELECT COUNT(*)::int AS count FROM master_keys WHERE project_id = $1', [project.id]);
+  const currentCount = Number(countRows[0]?.count || 0);
+  if (currentCount >= masterKeyLimit) return reply.code(402).send(ERR('PLAN_LIMIT_REACHED', `Your current plan allows ${masterKeyLimit} master key${masterKeyLimit === 1 ? '' : 's'}. Upgrade your plan to store more provider keys.`));
   const encrypted = encryptSecret(api_key, provider);
   await query(
     `INSERT INTO master_keys (id, project_id, provider, name, key_masked, ciphertext_b64, iv_b64, auth_tag_b64, key_version)
