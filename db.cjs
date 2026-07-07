@@ -244,6 +244,17 @@ async function initDb() {
       ALTER TABLE subkeys ADD COLUMN IF NOT EXISTS master_key_id UUID;
       ALTER TABLE subkeys ADD COLUMN IF NOT EXISTS auto_route_on_exhausted BOOLEAN NOT NULL DEFAULT false;
 
+      ALTER TABLE projects ADD COLUMN IF NOT EXISTS mode TEXT NOT NULL DEFAULT 'test' CHECK (mode IN ('test','production'));
+
+      CREATE TABLE IF NOT EXISTS project_allowed_domains (
+        id UUID PRIMARY KEY,
+        project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        domain TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE (project_id, domain)
+      );
+      CREATE INDEX IF NOT EXISTS idx_project_allowed_domains_project_id ON project_allowed_domains(project_id);
+
       ALTER TABLE master_keys ADD COLUMN IF NOT EXISTS project_id UUID REFERENCES projects(id) ON DELETE CASCADE;
       ALTER TABLE subkeys ADD COLUMN IF NOT EXISTS project_id UUID REFERENCES projects(id) ON DELETE CASCADE;
       ALTER TABLE request_logs ADD COLUMN IF NOT EXISTS project_id UUID REFERENCES projects(id) ON DELETE CASCADE;

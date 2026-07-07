@@ -179,6 +179,52 @@ const PROVIDERS = {
       { id: 'sonar-reasoning-pro', label: 'Sonar Reasoning Pro', inputPerMillion: 2.00, outputPerMillion: 8.00 },
     ],
   },
+  cohere: {
+    id: 'cohere',
+    label: 'Cohere',
+    defaultModel: 'command-r-08-2024',
+    compatibility: 'openai',
+    baseUrl: 'https://api.cohere.ai/v1/chat/completions',
+    keyPlaceholder: '...',
+    models: [
+      { id: 'command-r7b-12-2024', label: 'Command R7B', inputPerMillion: 0.0375, outputPerMillion: 0.15 },
+      { id: 'command-r-08-2024', label: 'Command R', inputPerMillion: 0.15, outputPerMillion: 0.60 },
+      { id: 'command-a-2025-03', label: 'Command A', inputPerMillion: 2.50, outputPerMillion: 10.00 },
+      { id: 'command-r-plus-08-2024', label: 'Command R+', inputPerMillion: 2.50, outputPerMillion: 10.00 },
+    ],
+  },
+  fireworks: {
+    id: 'fireworks',
+    label: 'Fireworks AI',
+    defaultModel: 'accounts/fireworks/models/llama-v3p3-70b-instruct',
+    compatibility: 'openai',
+    baseUrl: 'https://api.fireworks.ai/inference/v1/chat/completions',
+    keyPlaceholder: 'fw_...',
+    models: [
+      { id: 'accounts/fireworks/models/deepseek-v4-flash', label: 'DeepSeek V4 Flash', inputPerMillion: 0.14, outputPerMillion: 0.28 },
+      { id: 'accounts/fireworks/models/llama-v3p3-70b-instruct', label: 'Llama 3.3 70B', inputPerMillion: 0.90, outputPerMillion: 0.90 },
+      { id: 'accounts/fireworks/models/llama-v3p1-8b-instruct', label: 'Llama 3.1 8B', inputPerMillion: 0.10, outputPerMillion: 0.10 },
+      { id: 'accounts/fireworks/models/deepseek-v4-pro', label: 'DeepSeek V4 Pro', inputPerMillion: 1.74, outputPerMillion: 3.48 },
+      { id: 'accounts/fireworks/models/qwen3-32b', label: 'Qwen3 32B', inputPerMillion: 0.40, outputPerMillion: 1.60 },
+      { id: 'accounts/fireworks/models/mixtral-8x22b-instruct', label: 'Mixtral 8x22B', inputPerMillion: 0.24, outputPerMillion: 0.72 },
+    ],
+  },
+  deepinfra: {
+    id: 'deepinfra',
+    label: 'DeepInfra',
+    defaultModel: 'meta-llama/Llama-3.3-70B-Instruct-Turbo',
+    compatibility: 'openai',
+    baseUrl: 'https://api.deepinfra.com/v1/openai/chat/completions',
+    keyPlaceholder: 'api-key...',
+    models: [
+      { id: 'meta-llama/Llama-3.3-70B-Instruct-Turbo', label: 'Llama 3.3 70B Turbo', inputPerMillion: 0.13, outputPerMillion: 0.39 },
+      { id: 'meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo', label: 'Llama 3.1 8B Turbo', inputPerMillion: 0.02, outputPerMillion: 0.05 },
+      { id: 'Qwen/Qwen3-32B', label: 'Qwen3 32B', inputPerMillion: 0.10, outputPerMillion: 0.30 },
+      { id: 'deepseek-ai/DeepSeek-V3', label: 'DeepSeek V3', inputPerMillion: 0.85, outputPerMillion: 0.90 },
+      { id: 'deepseek-ai/DeepSeek-R1', label: 'DeepSeek R1', inputPerMillion: 0.85, outputPerMillion: 2.50 },
+      { id: 'meta-llama/Llama-4-Scout-17B-16E-Instruct', label: 'Llama 4 Scout', inputPerMillion: 0.08, outputPerMillion: 0.30 },
+    ],
+  },
 };
 
 const cloneProvider = (p) => ({
