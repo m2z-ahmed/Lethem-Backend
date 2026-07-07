@@ -179,8 +179,10 @@ async function rateLimitBySubkey(subkeyId, limit = DEFAULT_RPM_LIMIT) {
   return { remaining, reset, limit, allowed: count <= limit };
 }
 
+fastify.decorateRequest('project', null);
 fastify.addHook('onRequest', async (req) => {
   req._startedAt = Date.now();
+  req.projectHeader = String(req.headers['x-project-id'] || '').trim();
 });
 fastify.addHook('onResponse', async (req, reply) => {
   const ms = Date.now() - (req._startedAt || Date.now());
@@ -397,7 +399,7 @@ fastify.patch('/api/me', {
 
 async function getProject(req, reply) {
   const auth = await requireAuth(req, reply); if (!auth) return null;
-  const projectRef = String(req.headers['x-project-id'] || '').trim();
+  const projectRef = req.projectHeader;
   if (!projectRef) {
     reply.code(400).send(ERR('MISSING_PROJECT_HEADER', 'Missing x-project-id header'));
     return null;
@@ -422,6 +424,7 @@ async function getProject(req, reply) {
     reply.code(403).send(ERR('PROJECT_INACTIVE', 'project is not active'));
     return null;
   }
+  req.project = project;
   req.projectRole = project.organization_role;
   return project;
 }
@@ -906,11 +909,11 @@ fastify.patch('/api/quota-requests/:id', {
   if (r && status === 'approved') {
     if (r.request_type === 'credits' && r.amount) {
       const add = Math.max(0, Number(String(r.amount).replace(/[^0-9.]/g, '')) || 0) * 1000;
-      await query('UPDATE subkeys SET monthly_token_limit = COALESCE(monthly_token_limit,0) + $1 WHERE id = $2', [Math.round(add), r.subkey_id]);
+      await query('UPDATE subkeys SET monthly_token_limit = COALESCE(monthly_token_limit,0) + $1 WHERE id = $2 AND project_id = $3', [Math.round(add), r.subkey_id, project.id]);
     }
     if (r.request_type === 'expiry_extend' && r.amount) {
       const days = Math.max(0, Number(String(r.amount).replace(/[^0-9.]/g, '')) || 0);
-      await query("UPDATE subkeys SET expires_at = COALESCE(expires_at, NOW()) + ($1 || ' days')::interval WHERE id = $2", [String(Math.round(days)), r.subkey_id]);
+      await query("UPDATE subkeys SET expires_at = COALESCE(expires_at, NOW()) + ($1 || ' days')::interval WHERE id = $2 AND project_id = $3", [String(Math.round(days)), r.subkey_id, project.id]);
     }
   }
   await query(`DELETE FROM quota_requests WHERE project_id = $1 AND status IN ('approved','rejected') AND created_at < NOW() - INTERVAL '24 hours'`, [project.id]);
@@ -1005,7 +1008,7 @@ fastify.post('/v1/chat/completions', async (req, reply) => {
   }
 
   await insertRequestLog({ req, subkey, model: requestedModel, tokensUsed, promptTokens, completionTokens, status, errorReason, source, latencyMs: finishMs(), estimatedCostUsd });
-  await query(`UPDATE subkeys SET tokens_used = COALESCE(tokens_used,0) + $1, request_count = COALESCE(request_count,0) + 1 WHERE id = $2`, [tokensUsed, subkey.id]);
+  await query(`UPDATE subkeys SET tokens_used = COALESCE(tokens_used,0) + $1, request_count = COALESCE(request_count,0) + 1 WHERE id = $2 AND project_id = $3`, [tokensUsed, subkey.id, subkey.project_id]);
   return reply.code(statusCode).send(responseBody);
 });
 

@@ -244,6 +244,11 @@ async function initDb() {
       ALTER TABLE subkeys ADD COLUMN IF NOT EXISTS master_key_id UUID;
       ALTER TABLE subkeys ADD COLUMN IF NOT EXISTS auto_route_on_exhausted BOOLEAN NOT NULL DEFAULT false;
 
+      ALTER TABLE master_keys ADD COLUMN IF NOT EXISTS project_id UUID REFERENCES projects(id) ON DELETE CASCADE;
+      ALTER TABLE subkeys ADD COLUMN IF NOT EXISTS project_id UUID REFERENCES projects(id) ON DELETE CASCADE;
+      ALTER TABLE request_logs ADD COLUMN IF NOT EXISTS project_id UUID REFERENCES projects(id) ON DELETE CASCADE;
+      ALTER TABLE quota_requests ADD COLUMN IF NOT EXISTS project_id UUID REFERENCES projects(id) ON DELETE CASCADE;
+
       ALTER TABLE master_keys DROP CONSTRAINT IF EXISTS master_keys_provider_key;
 
       CREATE TABLE IF NOT EXISTS request_logs (
