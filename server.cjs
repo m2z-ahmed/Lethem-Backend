@@ -287,6 +287,11 @@ function getPlanMasterKeyLimit(planId) {
   return plan?.limits?.masterKeys ?? 999999;
 }
 
+function getPlanAllowedDomainsLimit(planId) {
+  const plan = billingPlanById(planId) || billingPlanById('free');
+  return plan?.limits?.allowedDomains ?? 999999;
+}
+
 function requireRazorpayConfig(reply) {
   const keyId = process.env.RAZORPAY_KEY_ID;
   const keySecret = process.env.RAZORPAY_KEY_SECRET;
@@ -405,7 +410,7 @@ async function getProject(req, reply) {
     return null;
   }
   const { rows } = await query(
-    `SELECT p.id,p.name,p.slug,p.status,p.organization_id,o.plan AS organization_plan,COALESCE(om.role, pm.role) AS organization_role
+    `SELECT p.id,p.name,p.slug,p.status,p.mode,p.organization_id,o.plan AS organization_plan,COALESCE(om.role, pm.role) AS organization_role
      FROM projects p
      JOIN organizations o ON o.id = p.organization_id
      LEFT JOIN organization_members om ON om.organization_id = p.organization_id AND om.user_id = $2 AND om.role IN ('owner','admin')
@@ -628,7 +633,7 @@ fastify.delete('/api/invites/:id', async (req, reply) => {
 fastify.get('/api/projects', async (req, reply) => {
   const auth = await requireAuth(req, reply); if (!auth) return;
   const { rows } = await query(
-    `SELECT p.id,p.name,p.slug,p.status,p.organization_id,COALESCE(om.role, pm.role) AS organization_role,EXTRACT(EPOCH FROM p.created_at)::bigint AS created_at
+    `SELECT p.id,p.name,p.slug,p.status,p.mode,p.organization_id,COALESCE(om.role, pm.role) AS organization_role,EXTRACT(EPOCH FROM p.created_at)::bigint AS created_at
      FROM projects p
      LEFT JOIN organization_members om ON om.organization_id = p.organization_id AND om.user_id = $1 AND om.role IN ('owner','admin')
      LEFT JOIN project_members pm ON pm.project_id = p.id AND pm.user_id = $1
@@ -694,6 +699,77 @@ fastify.route({
       return reply.code(500).send({ success: false, deleted: false, reason: 'internal_error' });
     }
   },
+});
+
+function isValidOrigin(value) {
+  if (!value || typeof value !== 'string') return false;
+  try {
+    const url = new URL(value.trim());
+    return url.protocol === 'http:' || url.protocol === 'https:';
+  } catch { return false; }
+}
+
+function normalizeOriginInput(value) {
+  return String(value || '').trim().replace(/\/+$/, '');
+}
+
+function isLocalhostOrigin(origin) {
+  try {
+    const url = new URL(origin);
+    const host = url.hostname;
+    return host === 'localhost' || host === '127.0.0.1' || host === '0.0.0.0' || host === '[::1]';
+  } catch { return false; }
+}
+
+fastify.get('/api/allowed-domains', async (req, reply) => {
+  const project = await getProject(req, reply); if (!project) return;
+  const { rows } = await query(
+    `SELECT id, domain, EXTRACT(EPOCH FROM created_at)::bigint AS created_at
+     FROM project_allowed_domains WHERE project_id = $1 ORDER BY created_at ASC`,
+    [project.id],
+  );
+  return rows;
+});
+
+fastify.post('/api/allowed-domains', async (req, reply) => {
+  const project = await getProject(req, reply); if (!project) return;
+  if (!['owner', 'admin'].includes(project.organization_role)) return reply.code(403).send(ERR('FORBIDDEN', 'Your organization role does not allow this action.'));
+  const domain = normalizeOriginInput(req.body?.domain || '');
+  if (!domain) return reply.code(400).send(ERR('VALIDATION_ERROR', 'domain is required'));
+  if (!isValidOrigin(domain)) return reply.code(400).send(ERR('INVALID_DOMAIN', 'Domain must be a valid URL with http:// or https:// scheme'));
+  const maxDomains = getPlanAllowedDomainsLimit(project.organization_plan || 'free');
+  if (maxDomains !== null) {
+    const { rows: countRows } = await query('SELECT COUNT(*)::int AS count FROM project_allowed_domains WHERE project_id = $1', [project.id]);
+    const current = Number(countRows[0]?.count || 0);
+    if (current >= maxDomains) return reply.code(402).send(ERR('PLAN_LIMIT_REACHED', `Your current plan allows ${maxDomains} allowed domain${maxDomains === 1 ? '' : 's'}. Upgrade to add more.`));
+  }
+  const id = randomUUID();
+  await query(
+    `INSERT INTO project_allowed_domains (id, project_id, domain) VALUES ($1, $2, $3)
+     ON CONFLICT (project_id, domain) DO NOTHING`,
+    [id, project.id, domain],
+  );
+  return { success: true, id, domain };
+});
+
+fastify.delete('/api/allowed-domains/:id', async (req, reply) => {
+  const project = await getProject(req, reply); if (!project) return;
+  if (!['owner', 'admin'].includes(project.organization_role)) return reply.code(403).send(ERR('FORBIDDEN', 'Your organization role does not allow this action.'));
+  const result = await query(
+    'DELETE FROM project_allowed_domains WHERE id = $1 AND project_id = $2',
+    [req.params.id, project.id],
+  );
+  if (!result.rowCount) return reply.code(404).send(ERR('NOT_FOUND', 'allowed domain not found'));
+  return { success: true };
+});
+
+fastify.patch('/api/projects/mode', async (req, reply) => {
+  const project = await getProject(req, reply); if (!project) return;
+  if (!['owner', 'admin'].includes(project.organization_role)) return reply.code(403).send(ERR('FORBIDDEN', 'Your organization role does not allow this action.'));
+  const mode = String(req.body?.mode || '').trim();
+  if (!['test', 'production'].includes(mode)) return reply.code(400).send(ERR('VALIDATION_ERROR', 'mode must be "test" or "production"'));
+  await query('UPDATE projects SET mode = $1, updated_at = NOW() WHERE id = $2', [mode, project.id]);
+  return { success: true, mode };
 });
 
 fastify.get('/api/master-keys', async (req, reply) => {
@@ -967,6 +1043,28 @@ fastify.post('/v1/chat/completions', async (req, reply) => {
   reply.header('X-RateLimit-Reset', String(rate.reset));
   if (!rate.allowed) return logAndReject(429, 'RATE_LIMIT_EXCEEDED', 'Too many requests. Try again later.', 'rate_limited', 'rate_limit_exceeded');
 
+  const origin = req.headers['origin'] || null;
+  if (origin) {
+    const { rows: projectRows } = await query('SELECT mode FROM projects WHERE id = $1', [subkey.project_id]);
+    const projectMode = projectRows[0]?.mode || 'test';
+
+    if (projectMode === 'test' && isLocalhostOrigin(origin)) {
+      // localhost always allowed in test mode
+    } else {
+      const { rows: domainRows } = await query(
+        'SELECT domain FROM project_allowed_domains WHERE project_id = $1',
+        [subkey.project_id],
+      );
+      const allowedDomains = domainRows.map((r) => r.domain);
+      const normalizedOrigin = normalizeOriginInput(origin);
+      const isAllowed = allowedDomains.some((d) => d === normalizedOrigin);
+      if (!isAllowed) {
+        req.log.warn({ event: 'gateway_request_rejected', error_reason: 'origin_not_allowed', origin, project_id: subkey.project_id }, 'gateway request rejected');
+        return logAndReject(403, 'ORIGIN_NOT_ALLOWED', 'Requests from this domain are not allowed.', 'rejected', 'origin_not_allowed');
+      }
+    }
+  }
+
   const providerConfig = getProvider(subkey.provider);
   if (!providerConfig) return logAndReject(400, 'UNKNOWN_PROVIDER', `Unknown provider ${subkey.provider}`, 'config_error', 'unknown_provider');
   const modelOwner = getProviderForModel(requestedModel);
@@ -1062,10 +1160,12 @@ async function start() {
       EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='organization_invites') AS organization_invites_ok,
       EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='organization_invites' AND column_name='invited_user_id') AS organization_invites_user_ok,
       EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='account_status') AS users_account_status_ok,
-      EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='last_seen_at') AS users_last_seen_ok
+      EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='last_seen_at') AS users_last_seen_ok,
+      EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='projects' AND column_name='mode') AS projects_mode_ok,
+      EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='project_allowed_domains') AS allowed_domains_ok
   `);
   const c = schemaChecks[0] || {};
-  if (!(c.projects_ok && c.subkeys_token_cipher_ok && c.subkeys_token_iv_ok && c.subkeys_token_tag_ok && c.health_ok && c.error_logs_ok && c.request_log_request_id_ok && c.request_log_provider_ok && c.request_log_error_reason_ok && c.request_log_cost_ok && c.users_ok && c.organizations_ok && c.organization_members_ok && c.project_members_ok && c.project_org_ok && c.org_plan_ok && c.billing_events_ok && c.organization_invites_ok && c.organization_invites_user_ok && c.users_account_status_ok && c.users_last_seen_ok)) {
+  if (!(c.projects_ok && c.subkeys_token_cipher_ok && c.subkeys_token_iv_ok && c.subkeys_token_tag_ok && c.health_ok && c.error_logs_ok && c.request_log_request_id_ok && c.request_log_provider_ok && c.request_log_error_reason_ok && c.request_log_cost_ok && c.users_ok && c.organizations_ok && c.organization_members_ok && c.project_members_ok && c.project_org_ok && c.org_plan_ok && c.billing_events_ok && c.organization_invites_ok && c.organization_invites_user_ok && c.users_account_status_ok && c.users_last_seen_ok && c.projects_mode_ok && c.allowed_domains_ok)) {
     throw new Error('Schema drift detected. Apply migrations in order: 001_initial_postgres.sql, 002_health_monitoring.sql, 003_request_error_logs.sql, 004_request_log_details.sql, 005_auth_organizations.sql, 006_billing_subscriptions.sql, 007_members_invites.sql, 008_invited_user_relation.sql, 009_user_registry_status.sql, 010_user_onboarding.sql, 011_project_scoped_members.sql');
   }
 
